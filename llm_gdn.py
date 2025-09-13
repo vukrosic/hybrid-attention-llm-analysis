@@ -16,6 +16,12 @@ import warnings
 import os
 import pickle
 from torchtune.modules import RotaryPositionalEmbeddings
+
+# Import the high-performance kernels
+from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from fla.modules import FusedRMSNormGated
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+
 warnings.filterwarnings('ignore')
 
 def set_seed(seed: int = 42):
@@ -66,9 +72,24 @@ class MoEModelConfig:
     expert_top_k: int = 2
     load_balancing_weight: float = 0.01
 
+    # Hybrid attention parameters
+    layer_types: Optional[List[str]] = None
+    linear_conv_kernel_dim: int = 4
+    linear_key_head_dim: int = 128
+    linear_value_head_dim: int = 128
+    linear_num_key_heads: int = 8
+    linear_num_value_heads: int = 8
+
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+        
+        # Set default layer types if not provided (every 4th layer uses full attention)
+        if self.layer_types is None:
+            self.layer_types = [
+                "linear_attention" if (i + 1) % 4 != 0 else "full_attention"
+                for i in range(self.n_layers)
+            ]
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
@@ -209,29 +230,208 @@ class MultiHeadAttention(nn.Module):
         self.rotary = Rotary(self.d_k, max_seq_len)
         self.dropout = dropout
 
-    def forward(self, x):
+    def forward(self, x, cache=None):
         batch_size, seq_len = x.size(0), x.size(1)
-        # B, T = x.size(0), x.size(1)
-        # qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.d_k).permute(2, 0, 3, 1, 4)
-        # Q, K, V = qkv[0], qkv[1], qkv[2]  # [B, H, T, D]
-
+        
         qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.n_heads, self.d_k)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         Q, K, V = qkv[0], qkv[1], qkv[2] # [B, H, T, D]
 
-        # Q = self.rotary(Q)
-        # K = self.rotary(K)
         # Apply RoPE on [B, T, H, D]
         Q = self.rotary(Q.transpose(1, 2)).transpose(1, 2)
         K = self.rotary(K.transpose(1, 2)).transpose(1, 2)
+
+        # Handle KV cache for generation
+        if cache is not None:
+            # Concatenate with past keys and values
+            K = torch.cat([cache['key'], K], dim=2)
+            V = torch.cat([cache['value'], V], dim=2)
 
         attn_output = F.scaled_dot_product_attention(
             Q, K, V, is_causal=True, dropout_p=self.dropout if self.training else 0.0
         )
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
-        # attn_output = attn_output.transpose(1, 2).reshape(B, T, self.d_model)
-        return self.w_o(attn_output)
+        
+        # Prepare cache for next step
+        new_cache = {'key': K, 'value': V}
+        
+        return self.w_o(attn_output), new_cache
 
+
+class GatedDeltaNet(nn.Module):
+    """GatedDeltaNet layer using high-performance fla and causal-conv1d kernels"""
+    def __init__(self, config: MoEModelConfig):
+        super().__init__()
+        self.d_model = config.d_model
+        self.num_v_heads = config.linear_num_value_heads
+        self.num_k_heads = config.linear_num_key_heads
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+
+        # Calculate projection dimensions
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.activation = 'silu'
+
+        # 1. Input Projections
+        proj_qkvz_size = self.key_dim * 2 + self.value_dim * 2
+        proj_ba_size = self.num_v_heads * 2
+        self.in_proj_qkvz = nn.Linear(self.d_model, proj_qkvz_size, bias=False)
+        self.in_proj_ba = nn.Linear(self.d_model, proj_ba_size, bias=False)
+        
+        # 2. Convolution Layer
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=True,
+            kernel_size=config.linear_conv_kernel_dim,
+            groups=self.conv_dim,
+            padding=config.linear_conv_kernel_dim - 1,
+        )
+
+        # 3. Discretization Parameters
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        A = torch.empty(self.num_v_heads).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        # 4. Fused Normalization and Gating
+        self.norm = FusedRMSNormGated(self.value_dim, activation=self.activation)
+        
+        # 5. Final Output Projection
+        self.out_proj = nn.Linear(self.value_dim, self.d_model, bias=False)
+
+    def forward(self, x, cache=None):
+        batch_size, seq_len, _ = x.shape
+        is_inference = seq_len == 1 and cache is not None
+
+        # =================================================================
+        # 1. Projections and Gate Calculations
+        # =================================================================
+        qkvz = self.in_proj_qkvz(x)
+        ba = self.in_proj_ba(x)
+        
+        query, key, value, z = torch.split(qkvz, [self.key_dim, self.key_dim, self.value_dim, self.value_dim], dim=-1)
+        beta, alpha = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+
+        # Calculate recurrent gates
+        beta = beta.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(alpha.float() + self.dt_bias)
+        
+        # =================================================================
+        # 2. Causal Convolution Step
+        # =================================================================
+        qkv_conv_input = torch.cat([query, key, value], dim=-1).transpose(1, 2)
+        
+        if is_inference:
+            # INFERENCE PATH: Use the _update kernel for a single token
+            qkv_conv_output = causal_conv1d_update(
+                qkv_conv_input, cache['conv_state'],
+                self.conv1d.weight.squeeze(1), self.conv1d.bias, self.activation
+            )
+        else:
+            # TRAINING/PREFILL PATH: Use the _fn kernel for the whole sequence
+            qkv_conv_output = causal_conv1d_fn(
+                x=qkv_conv_input,
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias,
+                activation=self.activation
+            )
+        
+        qkv_conv_output = qkv_conv_output.transpose(1, 2)
+        query, key, value = torch.split(qkv_conv_output, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+
+        # =================================================================
+        # 3. Reshape and Gated Delta Rule (Recurrent Step)
+        # =================================================================
+        query = query.view(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = key.view(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        value = value.view(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+        
+        # Repeat K/Q heads if they are grouped with more V heads
+        if self.num_v_heads // self.num_k_heads > 1:
+            repeat_factor = self.num_v_heads // self.num_k_heads
+            query = query.repeat_interleave(repeat_factor, dim=2)
+            key = key.repeat_interleave(repeat_factor, dim=2)
+            
+        if is_inference:
+            # INFERENCE PATH: Use the fused recurrent kernel for a single step
+            core_output, new_recurrent_state = fused_recurrent_gated_delta_rule(
+                query, key, value, g, beta,
+                initial_state=cache['recurrent_state'],
+                output_final_state=True
+            )
+        else:
+            # TRAINING/PREFILL PATH: Use the chunked kernel for numerical stability
+            core_output, new_recurrent_state = chunk_gated_delta_rule(
+                query, key, value, g=g, beta=beta,
+                initial_state=None,
+                output_final_state=True
+            )
+        
+        # =================================================================
+        # 4. Fused Gated Normalization & Final Projection
+        # =================================================================
+        core_output = core_output.reshape(batch_size * seq_len, self.value_dim)
+        z = z.reshape(batch_size * seq_len, self.value_dim)
+        
+        # This one call does: RMSNorm(core_output) * silu(z)
+        fused_output = self.norm(core_output, z)
+        fused_output = fused_output.view(batch_size, seq_len, self.value_dim)
+
+        output = self.out_proj(fused_output)
+
+        # For caching, prepare the new states
+        new_cache = {
+            'conv_state': qkv_conv_input if is_inference else F.pad(qkv_conv_input, (0, 0, self.conv1d.kernel_size[0] - seq_len, 0)),
+            'recurrent_state': new_recurrent_state
+        }
+
+        return output, new_cache
+
+
+class DynamicCache:
+    """Cache manager for hybrid attention models with both MultiHeadAttention and GatedDeltaNet layers"""
+    def __init__(self, config: MoEModelConfig, batch_size: int, device: torch.device):
+        self.key_cache = [None] * config.n_layers
+        self.value_cache = [None] * config.n_layers
+        self.conv_states = [None] * config.n_layers
+        self.recurrent_states = [None] * config.n_layers
+        self.config = config
+        
+        # Pre-allocate cache memory for GatedDeltaNet layers
+        for i in range(config.n_layers):
+            if config.layer_types[i] == "linear_attention":
+                # Fixed-size caches for GatedDeltaNet
+                conv_dim = (config.linear_num_key_heads * config.linear_key_head_dim) * 2 + (config.linear_num_value_heads * config.linear_value_head_dim)
+                self.conv_states[i] = torch.zeros(
+                    batch_size, conv_dim, config.linear_conv_kernel_dim, device=device
+                )
+                self.recurrent_states[i] = torch.zeros(
+                    batch_size, config.linear_num_value_heads, config.linear_key_head_dim, config.linear_value_head_dim, device=device
+                )
+
+    def get_layer_cache(self, layer_idx: int) -> Optional[dict]:
+        """Returns the cache for a specific layer."""
+        if self.config.layer_types[layer_idx] == "full_attention":
+            if self.key_cache[layer_idx] is None:
+                return None
+            return {'key': self.key_cache[layer_idx], 'value': self.value_cache[layer_idx]}
+        else:  # linear_attention
+            return {'conv_state': self.conv_states[layer_idx], 'recurrent_state': self.recurrent_states[layer_idx]}
+
+    def update_layer_cache(self, layer_idx: int, new_cache: dict):
+        """Updates the cache for a specific layer."""
+        if self.config.layer_types[layer_idx] == "full_attention":
+            if self.key_cache[layer_idx] is None:
+                self.key_cache[layer_idx] = new_cache['key']
+                self.value_cache[layer_idx] = new_cache['value']
+            else:
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], new_cache['key']], dim=2)
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], new_cache['value']], dim=2)
+        else:  # linear_attention
+            self.conv_states[layer_idx] = new_cache['conv_state']
+            self.recurrent_states[layer_idx] = new_cache['recurrent_state']
 
 
 class Expert(nn.Module):
@@ -378,41 +578,41 @@ class MixtureOfExperts(nn.Module):
         return aux_loss * self.load_balancing_weight
 
 class MoETransformerBlock(nn.Module):
-    """Transformer block with MoE"""
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        d_ff: int,
-        max_seq_len: int,
-        num_experts: int = 8,
-        top_k: int = 2,
-        dropout: float = 0.1
-    ):
+    """Hybrid Transformer block with MoE supporting both full attention and GatedDeltaNet"""
+    def __init__(self, config: MoEModelConfig, layer_idx: int):
         super().__init__()
+        self.layer_type = config.layer_types[layer_idx]
 
-        # Attention layer
-        self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout)
+        # Choose attention mechanism based on layer type
+        if self.layer_type == "full_attention":
+            self.token_mixer = MultiHeadAttention(
+                config.d_model, config.n_heads, config.max_seq_len, config.dropout
+            )
+        elif self.layer_type == "linear_attention":
+            self.token_mixer = GatedDeltaNet(config)
+        else:
+            raise ValueError(f"Unknown layer type: {self.layer_type}")
 
         # MoE layer
         self.feed_forward = MixtureOfExperts(
-            d_model, d_ff, num_experts, top_k, dropout
+            config.d_model, config.d_ff, config.num_experts, config.expert_top_k, config.dropout
         )
 
         # Normalization layers
-        self.norm1 = nn.RMSNorm(d_model)
-        self.norm2 = nn.RMSNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.norm1 = nn.RMSNorm(config.d_model)
+        self.norm2 = nn.RMSNorm(config.d_model)
+        self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
-        # Self-attention
-        attn_out = self.attention(self.norm1(x))
-        x = x + self.dropout(attn_out)
+    def forward(self, x, cache=None):
+        # Token mixing (attention or linear attention)
+        mixer_output, new_cache = self.token_mixer(self.norm1(x), cache=cache)
+        x = x + self.dropout(mixer_output)
 
         # MoE feed-forward
         ff_out, aux_loss = self.feed_forward(self.norm2(x))
         x = x + self.dropout(ff_out)
-        return x, aux_loss
+        
+        return x, aux_loss, new_cache
 
 
 class MoEMinimalLLM(nn.Module):
@@ -425,18 +625,9 @@ class MoEMinimalLLM(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.position_dropout = nn.Dropout(config.dropout)
 
-        # Transformer blocks with MoE
+        # Hybrid transformer blocks with MoE
         self.transformer_blocks = nn.ModuleList([
-            MoETransformerBlock(
-                config.d_model,
-                config.n_heads,
-                config.d_ff,
-                config.max_seq_len,
-                config.num_experts,
-                config.expert_top_k,
-                config.dropout
-            )
-            for i in range(config.n_layers)
+            MoETransformerBlock(config, i) for i in range(config.n_layers)
         ])
 
         # Output layers
@@ -457,19 +648,30 @@ class MoEMinimalLLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x, return_aux_loss=True):
+    def forward(self, x, cache: Optional[DynamicCache] = None, return_aux_loss=True):
         # Token embeddings
         x = self.token_embedding(x) * math.sqrt(self.config.d_model)
         x = self.position_dropout(x)
 
         # Collect auxiliary losses from MoE layers
         aux_losses = []
+        is_generating = cache is not None
 
         # Pass through transformer blocks
-        for block in self.transformer_blocks:
-            x, aux_loss = block(x)
+        for i, block in enumerate(self.transformer_blocks):
+            layer_cache = cache.get_layer_cache(i) if is_generating else None
+            
+            x, aux_loss, new_layer_cache = block(x, cache=layer_cache)
+            
             if aux_loss is not None and return_aux_loss:
                 aux_losses.append(aux_loss)
+            
+            # Update cache during generation or evaluation
+            if is_generating or not self.training:
+                if cache is None and not self.training:  # Create cache on first eval pass
+                    cache = DynamicCache(self.config, x.size(0), x.device)
+                if cache is not None:
+                    cache.update_layer_cache(i, new_layer_cache)
 
         # Output projection
         x = self.norm(x)
@@ -678,6 +880,38 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
 
     return model, final_eval
 
+
+def generate(model, tokenizer, prompt, max_new_tokens=50):
+    """Generate text using the hybrid model with efficient caching"""
+    model.eval()
+    device = next(model.parameters()).device
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    
+    # Initialize the cache for the batch
+    cache = DynamicCache(model.config, batch_size=input_ids.shape[0], device=device)
+    
+    # Prefill step (process the prompt)
+    with torch.no_grad():
+        logits = model(input_ids, cache=cache, return_aux_loss=False)
+
+    # Get the next token
+    next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(1)
+    generated_ids = [next_token.item()]
+    
+    # Decoding loop
+    for _ in range(max_new_tokens - 1):
+        with torch.no_grad():
+            logits = model(next_token, cache=cache, return_aux_loss=False)
+        
+        next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(1)
+        generated_ids.append(next_token.item())
+        
+        if next_token.item() == tokenizer.eos_token_id:
+            break
+            
+    return tokenizer.decode(generated_ids)
+
+
 if __name__ == "__main__":
     # Check system
     print(f"🔍 Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
@@ -715,9 +949,11 @@ if __name__ == "__main__":
     print(f"🧪 TRAINING: Mixture of Experts Model")
     print(f"{'='*60}")
 
-    print(f"\n📋 MoE Model Configuration:")
+    print(f"\n📋 Hybrid MoE Model Configuration:")
     print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
     print(f"   MoE: {config.num_experts} experts, top-{config.expert_top_k} routing")
+    print(f"   Hybrid: {config.layer_types.count('full_attention')} full attention, {config.layer_types.count('linear_attention')} GatedDeltaNet layers")
+    print(f"   GatedDeltaNet: {config.linear_num_key_heads}K/{config.linear_num_value_heads}V heads, {config.linear_key_head_dim}K/{config.linear_value_head_dim}V dims, conv_k={config.linear_conv_kernel_dim}")
     print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
     print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
 
@@ -726,10 +962,22 @@ if __name__ == "__main__":
     model, final_metrics = train_moe_model(config, train_loader, val_loader)
     total_time = time.time() - start_time
 
-    print(f"\n🎯 MoE Model Results:")
+    print(f"\n🎯 Hybrid MoE Model Results:")
     print(f"⏱️ Training time: {total_time/60:.1f} minutes")
     print(f"🏆 Final Results:")
     print(f"   Validation Loss: {final_metrics['val_loss']:.4f}")
     print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
     print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
+    
+    # Demonstrate generation capabilities
+    print(f"\n🤖 Testing Generation with Hybrid Caching:")
+    test_prompt = "The future of artificial intelligence"
+    generated_text = generate(model, tokenizer, test_prompt, max_new_tokens=20)
+    print(f"   Prompt: '{test_prompt}'")
+    print(f"   Generated: '{generated_text}'")
+    
+    print(f"{'='*60}")
+    print(f"✅ Successfully implemented hybrid attention with GatedDeltaNet!")
+    print(f"📊 Model uses {config.layer_types.count('linear_attention')} linear attention layers for efficiency")
+    print(f"🚀 and {config.layer_types.count('full_attention')} full attention layers for expressiveness")
     print(f"{'='*60}")
